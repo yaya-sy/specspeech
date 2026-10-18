@@ -1,0 +1,7 @@
+/scripts/build_soundsgood_compat.py
+/scripts/README.md
+/data/
+/benchmarks/
+/results/
+__pycache__/
+.DS_Store

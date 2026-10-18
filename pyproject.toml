@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specspeech"
+version = "0.1.0"
+description = "Speculative speech inference"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<3",
+    "soundfile>=0.12,<1",
+    "scipy>=1.10,<2",
+    "torch>=2.4,<3",
+    "transformers>=5.13.1,<6",
+    "accelerate>=1,<2",
+    "sentencepiece>=0.2,<1",
+    "vllm==0.30.0",
+]
+
+[project.optional-dependencies]
+# CUDA/driver versions are not supported pip environment markers. Keep SoundsGood
+# opt-in so the base install does not pull in its CUDA 13 runtime and plugins.
+# Experimental maintainer build; install its local wheel until GPU validation and publication.
+soundsgood = ["specspeech-soundsgood==0.2.0.post1"]
+benchmark = ["datasets>=4,<6"]
+punctuator = ["punctuators==0.0.7"]
+
+[project.scripts]
+specspeech = "specspeech.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+specspeech = "specspeech.asr.verifiers.vllm:register"
+
+[tool.setuptools]
+packages = [
+    "specspeech",
+    "specspeech.asr",
+    "specspeech.asr.lookups",
+    "specspeech.asr.speculators",
+    "specspeech.asr.verifiers",
+    "specspeech.asr.verifiers.vllm",
+]
+package-dir = {"specspeech" = "src"}
+
+[tool.setuptools.package-data]
+"specspeech.asr.lookups" = ["VLLM_LICENSE"]
+
