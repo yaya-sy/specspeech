@@ -22,6 +22,41 @@ BATCH_SIZE=8 MAX_AUDIO_SECONDS=300 bash scripts/export.sh parakeet \
   checkpoints/parakeet exported/parakeet-custom
 ```
 
+### OpenAI-compatible endpoint
+
+```bash
+uv pip install -e '.[endpoint]'
+specspeech asr endpoint \
+  --drafter parakeet --drafter-engine exported/parakeet-custom \
+  --k 32 --lookup suffix_gpu \
+  --drafter-max-audio-seconds 300 --verifier-max-audio-seconds 1200 \
+  --max-num-seqs 8 --max-pending 32 --gpu-memory-utilization 0.7 \
+  --max-model-len 32768 --max-new-tokens 8192 --language English \
+  --host 0.0.0.0 --port 8000 --served-model-name specspeech-asr
+```
+
+Send concurrent requests to the same endpoint; they share one verifier and drafter
+with continuous batching. vLLM provides the OpenAI transcription routes, upload
+decoding, language validation, response formatting, authentication and server lifecycle.
+
+```bash
+curl http://localhost:8000/v1/audio/transcriptions \
+  -F model=specspeech-asr -F file=@recording.wav -F language=en
+```
+
+Supports non-streaming greedy transcription with JSON responses. Qwen does
+not provide the segment timestamps required for `verbose_json`. The usual ASR options apply;
+`specspeech asr endpoint --help` also lists inherited vLLM options for model loading,
+precision, quantization, KV cache, token budgets, API keys and TLS.
+`--max-num-seqs` optionally caps verifier sequences per scheduling iteration.
+The endpoint currently uses one GPU.
+`--max-pending` also limits concurrent transcription uploads before audio preparation;
+excess requests receive HTTP 503 with `Retry-After: 1`.
+`--shutdown-timeout` defaults to 10 seconds. A stuck GPU worker still requires process termination.
+Native vLLM HTTP upload/decode limits also apply: the default decode limit is 600
+seconds per upload, independently of the verifier segment limit. Set
+`VLLM_MAX_AUDIO_DECODE_DURATION_S` when starting the endpoint to allow longer uploads.
+
 ### CLI inference
 
 Pass audio files or folders; folders are searched recursively and files are loaded as needed.
@@ -31,11 +66,33 @@ specspeech asr recordings/ \
   --drafter parakeet --drafter-engine exported/parakeet-custom \
   --k 32 --lookup suffix_gpu \
   --drafter-max-audio-seconds 300 --verifier-max-audio-seconds 1200 \
-  --batch-size 8 --max-pending 32 --gpu-memory-utilization 0.7 \
+  --max-num-seqs 8 --max-pending 32 --gpu-memory-utilization 0.7 \
   --max-model-len 32768 --max-new-tokens 8192 --language English
 ```
 
 See `specspeech asr --help` for all options.
+`--max-num-seqs` is an optional upper limit on verifier sequences per scheduling
+iteration; omitting it uses vLLM's default. Drafter batch capacity is independent.
+
+Use `--lookup-window-width 4 8 16` to widen the suffix search only after a miss.
+One value, such as `--lookup-window-width 4`, keeps the window fixed. Each value
+is the number of draft tokens on either side; the default is `8`. This applies
+to CPU/GPU lookup, the endpoint and benchmarks. In Python, pass
+`lookup_window_width=(4, 8, 16)` to the verifier.
+
+For [Granite TurboCTC](https://huggingface.co/ibm-granite/granite-speech-5.0-470m-turboctc),
+install its audio frontend and run directly from the Hugging Face checkpoint:
+
+```bash
+uv pip install -e '.[granite]'
+specspeech asr recordings/ --drafter granite --k 32 --lookup suffix_gpu
+```
+
+Granite uses Transformers with SDPA and BF16, with native punctuation and capitalization.
+It defaults to 40-second draft pieces and batches of up to 8 pieces, independently
+of the verifier's sequence limit.
+Drafting runs in the same background worker alongside verifier prefill and verification.
+No TensorRT export or SoundsGood installation is needed for this drafter.
 
 ### Python inference
 

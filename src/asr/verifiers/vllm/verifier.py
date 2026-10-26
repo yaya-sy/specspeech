@@ -20,16 +20,34 @@ class VLLMVerifier(ABC):
     MODEL_ID = None
     ARCHITECTURE = None
     PROCESSOR_CLASS = AutoProcessor
+    ENGINE_OPTIONS = {
+        "dtype", "quantization", "revision", "download_dir", "seed",
+        "kv_cache_dtype", "max_num_batched_tokens", "enforce_eager", "shutdown_timeout",
+    }
 
     def __init__(self, model_id=None, *, k=16, max_model_len=4096,
-                 max_num_seqs=1, enable_prefix_caching=True,
-                 gpu_memory_utilization=0.7, lookup="suffix"):
+                 max_num_seqs=None, enable_prefix_caching=True,
+                 gpu_memory_utilization=0.7, lookup="suffix", lookup_window_width=(8,), **engine_options):
         if lookup not in ("suffix", "suffix_gpu"):
             raise ValueError("lookup must be 'suffix' or 'suffix_gpu'")
         self.lookup_name, self.lookup = lookup, None
+        if isinstance(lookup_window_width, int):
+            lookup_window_width = (lookup_window_width,)
+        self.lookup_window_width = tuple(lookup_window_width)
+        if (not self.lookup_window_width or any(not isinstance(width, int) or width <= 0
+                                               for width in self.lookup_window_width)
+                or any(left >= right for left, right in zip(self.lookup_window_width, self.lookup_window_width[1:]))):
+            raise ValueError("lookup_window_width must contain positive, strictly increasing integers")
+        if unsupported := engine_options.keys() - self.ENGINE_OPTIONS:
+            raise ValueError(f"Unsupported vLLM options: {', '.join(sorted(unsupported))}")
         model_id = model_id or self.MODEL_ID
-        self.max_num_seqs = max_num_seqs
-        self.processor = self.PROCESSOR_CLASS.from_pretrained(model_id)
+        self.model_id = model_id
+        self.processor = self.PROCESSOR_CLASS.from_pretrained(
+            model_id, revision=engine_options.get("revision"), cache_dir=engine_options.get("download_dir"),
+        )
+        engine_options.setdefault("dtype", "bfloat16")
+        # The multimodal encoder cache follows this token budget.
+        engine_options.setdefault("max_num_batched_tokens", max_model_len)
         register()
         # Keep the one-GPU worker in this process: it can share draft buffers
         # and the CUDA context with draft ASR without an IPC handoff.
@@ -37,11 +55,9 @@ class VLLMVerifier(ABC):
         try:
             with set_env_var("VLLM_ENABLE_V1_MULTIPROCESSING", "0"):
                 self.engine = LLM(
-                    model=model_id, dtype="bfloat16", max_model_len=max_model_len,
+                    model=model_id, max_model_len=max_model_len,
                     max_num_seqs=max_num_seqs, block_size=16,
                     gpu_memory_utilization=gpu_memory_utilization,
-                    # The multimodal encoder cache follows this token budget.
-                    max_num_batched_tokens=max_model_len,
                     distributed_executor_backend="uni",
                     hf_overrides={"architectures": [self.ARCHITECTURE]},
                     speculative_config={
@@ -53,12 +69,14 @@ class VLLMVerifier(ABC):
                     async_scheduling=not k,
                     scheduler_cls="specspeech.asr.verifiers.vllm.scheduler.ASRScheduler" if k else None,
                     per_request_spec_decode_metrics="summary" if k else "none",
+                    **engine_options,
                 )
         finally:
             # vLLM caches environment values during initialization. Restore
             # the caller's values as well as its environment after setup.
             envs.disable_envs_cache()
             envs.enable_envs_cache()
+        self.max_num_seqs = self.engine.llm_engine.vllm_config.scheduler_config.max_num_seqs
         if k:
             self.engine.collective_rpc(bind_drafter)
         # Isolate speculative work from TensorRT capture; retain vLLM's stream for async inference.
@@ -73,6 +91,7 @@ class VLLMVerifier(ABC):
                     self.processor.tokenizer,
                     max(self.engine.llm_engine.model_config.get_vocab_size(),
                         max(self.processor.tokenizer.get_vocab().values()) + 1), self.stream.device,
+                    window_widths=self.lookup_window_width,
                 )
         self.input_executor = ThreadPoolExecutor(max_workers=1)
 
@@ -110,6 +129,7 @@ class VLLMVerifier(ABC):
             keys.append(key)
             DRAFTS[key] = draft if isinstance(draft, DraftBuffer) else DraftBuffer(self.decode, draft, finished=True)
             DRAFTS[key].lookup = self.lookup
+            DRAFTS[key].lookup_window_width = self.lookup_window_width
             params.append(SamplingParams(temperature=0, max_tokens=max_tokens,
                                          extra_args={"asr_draft_key": key}))
         try:

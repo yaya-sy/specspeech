@@ -2,5 +2,6 @@
 /scripts/README.md
 /data/
 /results/
+/tests/
 __pycache__/
 .DS_Store

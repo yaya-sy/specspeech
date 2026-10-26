@@ -9,9 +9,10 @@ DRAFTS = {}
 DRAFT_CHANGED = Condition()
 
 class DraftBuffer:
-    def __init__(self, decode, tokens=(), finished=False, *, lookup=None):
+    def __init__(self, decode, tokens=(), finished=False, *, lookup=None, lookup_window_width=(8,)):
         self.decode = decode
         self.lookup = lookup
+        self.lookup_window_width = lookup_window_width
         self.tokens = list(tokens)
         self.finished = finished
         self.error = None
@@ -76,7 +77,8 @@ def propose_drafts(buffers, outputs, limits):
                 pending.append((buffer, output))
             else:
                 buffer.cursor = suffix_lookup(output, buffer.tokens, buffer.last_evaluated,
-                                              buffer._text, min_position=buffer.last_accepted)
+                                              buffer._text, buffer.lookup_window_width,
+                                              min_position=buffer.last_accepted)
                 buffer._lookup_state = state
         if pending:
             selected, targets = zip(*pending)

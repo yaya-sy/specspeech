@@ -19,19 +19,24 @@ from corpus import SUITE, dataset_rows, read_audio
 
 
 def prefetch_samples(rows, capacity):
-    """Read and hash a bounded number of waveforms ahead of inference."""
+    """Read and hash waveforms; capacity zero loads lazily without prefetch."""
     def load(row):
         audio = read_audio(row["path"])
         return {**row, "audio_sha256": hashlib.sha256(audio.tobytes()).hexdigest(),
                 "audio_seconds": len(audio) / 16000}, audio
 
+    if capacity == 0:
+        for row in rows:
+            yield load(row)
+        return
     rows = iter(rows)
     with ThreadPoolExecutor(max_workers=1) as loader:
         pending = deque(loader.submit(load, row) for row in islice(rows, capacity))
         while pending:
-            yield pending.popleft().result()
+            sample = pending.popleft().result()
             if (row := next(rows, None)) is not None:
                 pending.append(loader.submit(load, row))
+            yield sample
 
 
 def main():
@@ -41,32 +46,45 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True, help="New directory for this condition")
     parser.add_argument("--datasets", nargs="+", default=list(SUITE),
                         help="Dataset directories containing references.tsv; defaults to the seven-dataset suite")
-    parser.add_argument("--batch-size", type=int, default=8,
-                        help="Maximum active vLLM requests, or HF inference batch size (default: 8)")
+    parser.add_argument("--max-num-seqs", type=int, default=8,
+                        help="Maximum vLLM sequences per iteration, or HF inference batch size (default: 8)")
+    parser.add_argument("--batch-size", dest="max_num_seqs", type=int,
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument("--max-pending", type=int,
-                        help="Maximum pending vLLM requests and waveform prefetch count (default: 4 * batch-size)")
-    parser.add_argument("--drafter", choices=("parakeet", "zipformer"), default="zipformer")
+                        help="Pending inference requests (default: 4 * max-num-seqs); max-num-seqs 1 forces one request")
+    parser.add_argument("--audio-prefetch", type=int, default=32,
+                        help="Audios to load, downmix, resample and hash ahead on CPU; 0 disables (default: 32)")
+    parser.add_argument("--drafter", choices=("parakeet", "zipformer", "granite"), default="zipformer")
     parser.add_argument("--drafter-engine")
     parser.add_argument("--drafter-max-audio-seconds", type=int,
-                        help="Maximum draft piece duration (default: Parakeet 300, Zipformer 40)")
+                        help="Maximum draft piece duration (default: Parakeet 300, Zipformer/Granite 40)")
     parser.add_argument("--verifier-max-audio-seconds", type=int, default=1200)
     parser.add_argument("--k", type=int, default=16)
     parser.add_argument("--lookup", choices=("suffix", "suffix_gpu"), default="suffix")
+    parser.add_argument("--lookup-window-width", type=int, nargs="+", default=[8], metavar="N",
+                        help="Tokens on each side; try increasing widths after a miss (default: 8)")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7,
                         help="GPU memory fraction budgeted for either vLLM backend (default: 0.7); unused by HF")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--warmups", type=int, default=5)
     args = parser.parse_args()
+    if args.audio_prefetch < 0:
+        parser.error("--audio-prefetch must be nonnegative")
+    if min(args.lookup_window_width) <= 0 or any(left >= right for left, right in
+                                                zip(args.lookup_window_width, args.lookup_window_width[1:])):
+        parser.error("--lookup-window-width requires positive, strictly increasing integers")
     if args.drafter_max_audio_seconds is None:
         args.drafter_max_audio_seconds = 300 if args.drafter == "parakeet" else 40
-    if args.max_pending is None:
-        args.max_pending = 4 * args.batch_size
-    if min(args.batch_size, args.drafter_max_audio_seconds, args.verifier_max_audio_seconds, args.k,
+    if args.max_num_seqs == 1 or args.max_pending is None:
+        args.max_pending = 1 if args.max_num_seqs == 1 else 4 * args.max_num_seqs
+    if min(args.max_num_seqs, args.drafter_max_audio_seconds, args.verifier_max_audio_seconds, args.k,
            args.max_model_len, args.max_new_tokens, args.warmups, args.max_pending) <= 0:
-        parser.error("Batch size, durations and token limits must be positive")
-    if args.max_pending < args.batch_size:
-        parser.error("--max-pending must be at least --batch-size")
+        parser.error("Sequence limit, durations and token limits must be positive")
+    if args.max_pending < args.max_num_seqs:
+        parser.error("--max-pending must be at least --max-num-seqs")
+    if args.drafter == "granite" and args.drafter_engine:
+        parser.error("--drafter-engine applies only to Parakeet and Zipformer")
     if len(set(args.datasets)) != len(args.datasets):
         parser.error("Each dataset must occur once")
     if not torch.cuda.is_available():
@@ -77,8 +95,8 @@ def main():
         parser.error("A corpus clip exceeds the verifier duration limit; refusing to change corpus segmentation")
     args.output_dir.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(1)
-    batches = [rows[start:start + args.batch_size] for rows in datasets.values()
-               for start in range(0, len(rows), args.batch_size)]
+    batches = [rows[start:start + args.max_num_seqs] for rows in datasets.values()
+               for start in range(0, len(rows), args.max_num_seqs)]
     warmup_batches = sorted(batches, key=lambda batch: max(row["duration"] for row in batch))
 
     def load(batch):
@@ -114,14 +132,14 @@ def main():
 
                 torch.cuda.synchronize()
                 started = time.perf_counter()
-                samples = prefetch_samples(rows, args.max_pending)
+                samples = prefetch_samples(rows, args.audio_prefetch)
                 results = run_inference(samples)
                 try:
                     # Iteration executes inference and yields each completed request.
                     for completed, (row, output) in enumerate(results, 1):
                         audio_seconds += row["audio_seconds"]
                         save(row, row["audio_sha256"], output)
-                        if completed == 1 or completed % (100 * args.batch_size) == 0:
+                        if completed == 1 or completed % (100 * args.max_num_seqs) == 0:
                             elapsed = time.perf_counter() - started
                             print(f"{name}: {completed}/{len(rows)}; {audio_seconds / elapsed:.1f} RTFx", flush=True)
                 finally:
@@ -153,8 +171,9 @@ def main():
         total_seconds = sum(report["seconds"] for report in dataset_reports.values())
         total_audio = sum(report["audio_seconds"] for report in dataset_reports.values())
         report = {
-            "backend": args.backend, "settings": settings, "batch_size": args.batch_size,
+            "backend": args.backend, "settings": settings, "max_num_seqs": args.max_num_seqs,
             "max_pending": args.max_pending,
+            "audio_prefetch": args.audio_prefetch,
             "dtype": "bfloat16", "temperature": 0, "language": "English",
             "gpu": torch.cuda.get_device_name(), "versions": versions,
             "torch_cuda": torch.version.cuda,
@@ -164,7 +183,10 @@ def main():
             "warmups": args.warmups, "passes": 1, "complete_suite": set(datasets) == set(SUITE),
             "matches_published_clip_counts": set(datasets) == set(SUITE)
             and all(len(rows) == SUITE[name][3] for name, rows in datasets.items()),
-            "timing_scope": "synchronized dataset wall time with bounded waveform prefetch; includes loading, resampling, hashing, features, drafting and serialization",
+            "timing_scope": ("synchronized dataset wall time with "
+                             + ("one audio inference at a time; " if args.max_num_seqs == 1 else "")
+                             + ("bounded CPU waveform prefetch" if args.audio_prefetch else "no waveform prefetch")
+                             + "; includes loading, resampling, hashing, features, drafting and serialization"),
             "datasets": dataset_reports, "clips": sum(item["clips"] for item in dataset_reports.values()),
             "audio_seconds": total_audio, "seconds": total_seconds, "rtfx": total_audio / total_seconds,
         }

@@ -48,7 +48,7 @@ def make_backend(args, cleanup):
 
         def run(samples):
             samples = iter(samples)
-            while batch := list(islice(samples, args.batch_size)):
+            while batch := list(islice(samples, args.max_num_seqs)):
                 outputs = infer_batch([audio for _, audio in batch])
                 if len(outputs) != len(batch):
                     raise RuntimeError("Backend did not return one output per clip")
@@ -58,32 +58,45 @@ def make_backend(args, cleanup):
                      "compile_mode": "reduce-overhead" if args.backend == "hf" else "default",
                      "cache": "static" if args.backend == "hf" else "dynamic"}
 
-    from specspeech.asr.speculators import SoundsGoodDrafter
+    from specspeech.asr.speculators import GraniteDrafter, SoundsGoodDrafter
     from specspeech.asr.verifiers.vllm import QwenASRVerifier
 
-    drafter = SoundsGoodDrafter(
-        args.drafter_engine, model=args.drafter, drafter_max_audio_seconds=args.drafter_max_audio_seconds,
-    ) if args.backend == "speculative" else None
+    drafter = None
+    if args.backend == "speculative":
+        if args.drafter == "granite":
+            drafter = GraniteDrafter(
+                drafter_max_audio_seconds=args.drafter_max_audio_seconds,
+            )
+        else:
+            drafter = SoundsGoodDrafter(
+                args.drafter_engine, model=args.drafter, drafter_max_audio_seconds=args.drafter_max_audio_seconds,
+            )
     verifier = QwenASRVerifier(
         k=args.k if drafter else 0, max_model_len=args.max_model_len,
-        enable_prefix_caching=False, max_num_seqs=args.batch_size,
+        enable_prefix_caching=False, max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
         lookup=args.lookup,
+        lookup_window_width=args.lookup_window_width,
     )
     cleanup.callback(verifier.close)
 
     def stream(samples):
-        return verifier.transcribe(
-            samples, drafter, max_pending=args.max_pending,
-            max_tokens=args.max_new_tokens,
-        )
+        batches = ([sample] for sample in samples) if args.max_num_seqs == 1 else (samples,)
+        for batch in batches:
+            yield from verifier.transcribe(
+                batch, drafter, max_pending=args.max_pending,
+                max_tokens=args.max_new_tokens,
+            )
 
     return stream, {"model": verifier.MODEL_ID, "implementation": "vllm.model_executor.models.qwen3_asr",
                     "cuda_graphs_enabled": True, "speculative_tokens": args.k if drafter else 0,
                     "gpu_memory_utilization": args.gpu_memory_utilization,
                     "drafter": args.drafter if drafter else None,
-                    "drafter_engine": str(drafter.engine_path) if drafter else None,
+                    "drafter_engine": str(drafter.engine_path) if isinstance(drafter, SoundsGoodDrafter) else None,
+                    "drafter_model": drafter.model_id if isinstance(drafter, GraniteDrafter) else None,
                     "drafter_batch_size": drafter.batch_size if drafter else None,
-                    "drafter_bucket_seconds": 0.1 if drafter else None,
+                    "audio_submission": "one_at_a_time" if args.max_num_seqs == 1 else "continuous_queue",
+                    "drafter_bucket_seconds": 0.1 if isinstance(drafter, SoundsGoodDrafter) else None,
                     "lookup": verifier.lookup_name if drafter else None,
+                    "lookup_window_width": verifier.lookup_window_width if drafter else None,
                     "draft_readiness": "incremental_with_request_pause" if drafter else None}

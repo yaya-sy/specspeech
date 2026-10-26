@@ -8,15 +8,18 @@ from pathlib import Path
 
 def summarize_corpus(reports, root):
     reference = next(iter(reports.values()))
+    max_num_seqs = reference.get("max_num_seqs", reference.get("batch_size"))
     for report in reports.values():
         if report["timing_scope"] != reference["timing_scope"]:
             raise ValueError("Conditions must use the same timing scope")
         if report.get("max_pending", report.get("request_queue_size")) != reference.get("max_pending", reference.get("request_queue_size")):
             raise ValueError("Conditions must use the same max_pending limit")
-        if (report["batch_size"], report["max_model_len"], report["max_new_tokens"], report["gpu"]) != (
-            reference["batch_size"], reference["max_model_len"], reference["max_new_tokens"], reference["gpu"]
+        if report.get("audio_prefetch") != reference.get("audio_prefetch"):
+            raise ValueError("Conditions must use the same audio_prefetch limit")
+        if (report.get("max_num_seqs", report.get("batch_size")), report["max_model_len"], report["max_new_tokens"], report["gpu"]) != (
+            max_num_seqs, reference["max_model_len"], reference["max_new_tokens"], reference["gpu"]
         ):
-            raise ValueError("Corpus conditions must use the same batch, token limits and GPU model")
+            raise ValueError("Corpus conditions must use the same sequence limit, token limits and GPU model")
         if {name: item["audio_sha256"] for name, item in report["datasets"].items()} != {
             name: item["audio_sha256"] for name, item in reference["datasets"].items()
         }:
@@ -34,7 +37,8 @@ def summarize_corpus(reports, root):
                "audio_hours": reference["audio_seconds"] / 3600,
                "timing_scope": reference["timing_scope"],
                "max_pending": reference.get("max_pending", reference.get("request_queue_size")),
-               "batch_size": reference["batch_size"], "best_hf": best_hf, "results": results}
+               "audio_prefetch": reference.get("audio_prefetch"),
+               "max_num_seqs": max_num_seqs, "best_hf": best_hf, "results": results}
     for name, item in results.items():
         print(f"{name:16s} {item['rtfx']:9.2f} RTFx  speculative speedup {item['speculative_speedup']:.2f}x")
     (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

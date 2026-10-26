@@ -13,7 +13,7 @@ dependencies = [
     "soundfile>=0.12,<1",
     "scipy>=1.10,<2",
     "torch>=2.4,<3",
-    "transformers>=5.13.1,<6",
+    "transformers>=5.16.0,<6",
     "accelerate>=1,<2",
     "sentencepiece>=0.2,<1",
     "vllm==0.30.0",
@@ -25,10 +25,12 @@ dependencies = [
 # Experimental maintainer build; install its local wheel until GPU validation and publication.
 soundsgood = ["specspeech-soundsgood==0.2.0.post1"]
 benchmark = ["datasets>=4,<6"]
+granite = ["torchaudio>=2.4,<3"]
+endpoint = ["vllm[audio]==0.30.0", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "python-multipart>=0.0.18,<1"]
 punctuator = ["punctuators==0.0.7"]
 
 [project.scripts]
-specspeech = "specspeech.cli:main"
+specspeech = "specspeech.asr.cli:main"
 
 [project.entry-points."vllm.general_plugins"]
 specspeech = "specspeech.asr.verifiers.vllm:register"
